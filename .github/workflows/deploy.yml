@@ -1,0 +1,152 @@
+name: Aggregate all packages
+
+on:
+  push:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [package-built]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  Aggregate:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch and aggregate feeds by architecture
+        run: |
+          set -euo pipefail
+
+          ARCHS=("aarch64-3.10" "armv7-3.2" "mips-3.4" "mipsel-3.4" "x64-3.2")
+          ROOT="out/_pages"
+          mkdir -p "$ROOT"
+
+          for arch in "${ARCHS[@]}"; do
+            mkdir -p "$ROOT/$arch"
+          done
+
+          declare -A FEEDS
+          FEEDS["web4static"]="https://spatiumstas.github.io/web4static"
+          FEEDS["sms2gram"]="https://spatiumstas.github.io/sms2gram"
+          FEEDS["KeenSnap"]="https://spatiumstas.github.io/KeenSnap"
+
+          for pkg in "${!FEEDS[@]}"; do
+            BASE_URL="${FEEDS[$pkg]}"
+            echo "→ Processing $pkg ($BASE_URL)"
+
+            if curl -f -sSL --head "$BASE_URL/all/Packages" >/dev/null 2>&1; then
+              echo "  ✓ all-architecture feed found"
+
+              curl -f -sSL "$BASE_URL/all/Packages" -o "/tmp/${pkg}.Packages"
+
+              for arch in "${ARCHS[@]}"; do
+                echo "    → Adding to $arch"
+                sed "s|^Architecture: .*|Architecture: $arch|" "/tmp/${pkg}.Packages" >> "$ROOT/$arch/Packages"
+              done
+
+              while read -r filename; do
+                [ -z "$filename" ] && continue
+                if curl -f -sSL -o "/tmp/$filename" "$BASE_URL/all/$filename"; then
+                  for arch in "${ARCHS[@]}"; do
+                    cp "/tmp/$filename" "$ROOT/$arch/$filename"
+                    echo "      ✓ $filename → $arch"
+                  done
+                  rm -f "/tmp/$filename"
+                else
+                  echo "      ✗ Failed to download $filename"
+                fi
+              done < <(grep '^Filename:' "/tmp/${pkg}.Packages" | cut -d' ' -f2-)
+
+              rm -f "/tmp/${pkg}.Packages"
+
+            else
+              echo "  ✓ per-architecture feed"
+              for arch in "${ARCHS[@]}"; do
+                if curl -f -sSL "$BASE_URL/$arch/Packages" -o "/tmp/${pkg}_${arch}.Packages" 2>/dev/null; then
+                  echo "    ✓ Found for $arch"
+                  cat "/tmp/${pkg}_${arch}.Packages" >> "$ROOT/$arch/Packages"
+
+                  while read -r filename; do
+                    [ -z "$filename" ] && continue
+                    if curl -f -sSL -o "$ROOT/$arch/$filename" "$BASE_URL/$arch/$filename"; then
+                      echo "      ✓ $filename → $arch"
+                    else
+                      echo "      ✗ $filename"
+                    fi
+                  done < <(grep '^Filename:' "/tmp/${pkg}_${arch}.Packages" | cut -d' ' -f2-)
+
+                  rm -f "/tmp/${pkg}_${arch}.Packages"
+                fi
+              done
+            fi
+          done
+
+          echo "→ Finalizing all architectures..."
+          for arch in "${ARCHS[@]}"; do
+            if [ -s "$ROOT/$arch/Packages" ]; then
+              cd "$ROOT/$arch"
+
+              awk 'NF {print; blank=0} !NF {if (!blank) {print ""; blank=1}}' Packages > Packages.clean && mv Packages.clean Packages || true
+
+              gzip -kf Packages
+
+              echo '<html><head><title>Index of /'${arch}'/</title></head><body><h1>Index of /'${arch}'/</h1><hr><pre>' > index.html
+              echo '<a href="../">../</a>' >> index.html
+              echo '<a href="Packages">Packages</a>' >> index.html
+              echo '<a href="Packages.gz">Packages.gz</a>' >> index.html
+              ls -1 *.ipk 2>/dev/null | sed 's/.*/<a href="&">&<\/a>/' >> index.html || true
+              echo '</pre><hr></body></html>' >> index.html
+
+              PKG_COUNT=$(awk -v RS='' 'END{print NR}' Packages 2>/dev/null || echo 0)
+              echo "  ✓ ${arch} done (${PKG_COUNT} packages)"
+              cd - >/dev/null
+            else
+              echo "  ⚠ ${arch} has no packages"
+            fi
+          done
+
+          echo '<html><head><title>Index of /</title></head><body><h1>Index of /</h1><hr><pre>' > "$ROOT/index.html"
+          for arch in "${ARCHS[@]}"; do
+            [ -s "$ROOT/$arch/Packages" ] && echo "<a href=\"${arch}/\">${arch}/</a>" >> "$ROOT/index.html"
+          done
+          echo '</pre><hr></body></html>' >> "$ROOT/index.html"
+
+          echo "✅ Aggregation complete"
+          ls -laR "$ROOT" | head -n 100
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./out/_pages
+
+  Deploy:
+    needs: Aggregate
+    runs-on: ubuntu-22.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        run: |
+          echo "Repository deployed with multi-architecture structure" >> $GITHUB_STEP_SUMMARY
