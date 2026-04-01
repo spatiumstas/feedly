@@ -1,7 +1,6 @@
 name: Aggregate all packages
 
 on:
-  push:
   workflow_dispatch:
   repository_dispatch:
     types: [package-built]
@@ -24,72 +23,231 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Fetch and aggregate feeds by architecture
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
+          get_control_field() {
+            local field="$1"
+            local file="$2"
+            awk -v key="$field" '
+              BEGIN { IGNORECASE=1; in_field=0; value=""; printed=0 }
+              {
+                if (in_field) {
+                  if ($0 ~ /^[[:space:]]+/) {
+                    sub(/^[[:space:]]+/, "", $0)
+                    value = value " " $0
+                    next
+                  }
+                  print value
+                  printed=1
+                  exit
+                }
+
+                if (tolower($0) ~ "^" tolower(key) ":[[:space:]]*") {
+                  sub(/^[^:]+:[[:space:]]*/, "", $0)
+                  value = $0
+                  in_field = 1
+                }
+              }
+              END {
+                if (!printed && in_field && value != "") {
+                  print value
+                }
+              }
+            ' "$file" | tr -d '\r' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+          }
+
+          extract_archive_to_dir() {
+            local archive="$1"
+            local out_dir="$2"
+            case "$archive" in
+              *.tar.gz|*.tgz)
+                tar -xzf "$archive" -C "$out_dir" 2>/dev/null || true
+                ;;
+              *.tar.xz)
+                tar -xJf "$archive" -C "$out_dir" 2>/dev/null || true
+                ;;
+              *.tar.zst)
+                tar --zstd -xf "$archive" -C "$out_dir" 2>/dev/null || true
+                ;;
+              *.tar)
+                tar -xf "$archive" -C "$out_dir" 2>/dev/null || true
+                ;;
+              *)
+                tar -xf "$archive" -C "$out_dir" 2>/dev/null || true
+                ;;
+            esac
+          }
+
           ARCHS=("aarch64-3.10" "armv7-3.2" "mips-3.4" "mipsel-3.4" "x64-3.2")
+          declare -A ARCH_ALIASES
+          ARCH_ALIASES["aarch64"]="aarch64-3.10"
+          ARCH_ALIASES["armv7"]="armv7-3.2"
+          ARCH_ALIASES["mips"]="mips-3.4"
+          ARCH_ALIASES["mipsel"]="mipsel-3.4"
+          ARCH_ALIASES["x64"]="x64-3.2"
+          ARCH_ALIASES["amd64"]="x64-3.2"
           ROOT="out/_pages"
           mkdir -p "$ROOT"
+          parse_failures=0
 
           for arch in "${ARCHS[@]}"; do
             mkdir -p "$ROOT/$arch"
           done
 
-          declare -A FEEDS
-          FEEDS["web4static"]="https://spatiumstas.github.io/web4static"
-          FEEDS["sms2gram"]="https://spatiumstas.github.io/sms2gram"
-          FEEDS["KeenSnap"]="https://spatiumstas.github.io/KeenSnap"
+          # Format: owner/repo
+          SOURCES=(
+            "spatiumstas/web4static"
+            "spatiumstas/sms2gram"
+            "spatiumstas/KeenSnap"
+            "spatiumstas/entware-go"
+          )
 
-          for pkg in "${!FEEDS[@]}"; do
-            BASE_URL="${FEEDS[$pkg]}"
-            echo "→ Processing $pkg ($BASE_URL)"
+          for src in "${SOURCES[@]}"; do
+            repo="$src"
+            echo "→ Processing $repo (channel=release)"
 
-            if curl -f -sSL --head "$BASE_URL/all/Packages" >/dev/null 2>&1; then
-              echo "  ✓ all-architecture feed found"
+            release_json=$(gh api "repos/${repo}/releases" --paginate)
 
-              curl -f -sSL "$BASE_URL/all/Packages" -o "/tmp/${pkg}.Packages"
+            selected=$(echo "$release_json" | jq '[.[] | select(.draft == false and .prerelease == false)][0]')
 
-              for arch in "${ARCHS[@]}"; do
-                echo "    → Adding to $arch"
-                sed "s|^Architecture: .*|Architecture: $arch|" "/tmp/${pkg}.Packages" >> "$ROOT/$arch/Packages"
-              done
-
-              while read -r filename; do
-                [ -z "$filename" ] && continue
-                if curl -f -sSL -o "/tmp/$filename" "$BASE_URL/all/$filename"; then
-                  for arch in "${ARCHS[@]}"; do
-                    cp "/tmp/$filename" "$ROOT/$arch/$filename"
-                    echo "      ✓ $filename → $arch"
-                  done
-                  rm -f "/tmp/$filename"
-                else
-                  echo "      ✗ Failed to download $filename"
-                fi
-              done < <(grep '^Filename:' "/tmp/${pkg}.Packages" | cut -d' ' -f2-)
-
-              rm -f "/tmp/${pkg}.Packages"
-
-            else
-              echo "  ✓ per-architecture feed"
-              for arch in "${ARCHS[@]}"; do
-                if curl -f -sSL "$BASE_URL/$arch/Packages" -o "/tmp/${pkg}_${arch}.Packages" 2>/dev/null; then
-                  echo "    ✓ Found for $arch"
-                  cat "/tmp/${pkg}_${arch}.Packages" >> "$ROOT/$arch/Packages"
-
-                  while read -r filename; do
-                    [ -z "$filename" ] && continue
-                    if curl -f -sSL -o "$ROOT/$arch/$filename" "$BASE_URL/$arch/$filename"; then
-                      echo "      ✓ $filename → $arch"
-                    else
-                      echo "      ✗ $filename"
-                    fi
-                  done < <(grep '^Filename:' "/tmp/${pkg}_${arch}.Packages" | cut -d' ' -f2-)
-
-                  rm -f "/tmp/${pkg}_${arch}.Packages"
-                fi
-              done
+            if [ "$(echo "$selected" | jq -r '.id // empty')" = "" ]; then
+              echo "  ⚠ No release found for $repo"
+              continue
             fi
+
+            tag=$(echo "$selected" | jq -r '.tag_name')
+            echo "  ✓ Using tag $tag"
+
+            mapfile -t urls < <(echo "$selected" | jq -r '.assets[] | select(.name | test("\\.ipk$")) | .browser_download_url')
+
+            if [ ${#urls[@]} -eq 0 ]; then
+              echo "  ⚠ No ipk assets in $repo@$tag"
+              continue
+            fi
+
+            for url in "${urls[@]}"; do
+              filename="${url##*/}"
+              tmpfile="/tmp/${repo//\//_}_${filename}"
+
+              if ! curl -f -sSL "$url" -o "$tmpfile"; then
+                echo "    ✗ Failed to download $filename"
+                continue
+              fi
+
+              pkg_name=""
+              pkg_version=""
+              pkg_arch=""
+              pkg_depends=""
+              pkg_license=""
+              pkg_section=""
+              pkg_description=""
+
+              workdir=$(mktemp -d)
+              control_candidates=()
+
+              if ar t "$tmpfile" > "$workdir/ar.list" 2>/dev/null; then
+                while IFS= read -r member; do
+                  member="$(printf '%s' "$member" | tr -d '\r')"
+                  [ -n "$member" ] || continue
+                  if printf '%s' "$member" | grep -Eq '^(\./)?control\.tar(\..+)?$'; then
+                    out_member="${member#./}"
+                    mkdir -p "$(dirname "$workdir/$out_member")"
+                    if ar p "$tmpfile" "$member" > "$workdir/$out_member" 2>/dev/null; then
+                      control_candidates+=("$workdir/$out_member")
+                    fi
+                  fi
+                done < "$workdir/ar.list"
+              else
+                if tar -tf "$tmpfile" > "$workdir/tar.list" 2>/dev/null; then
+                  while IFS= read -r member; do
+                    member="$(printf '%s' "$member" | tr -d '\r')"
+                    [ -n "$member" ] || continue
+                    if printf '%s' "$member" | grep -Eq '(^|/)control\.tar(\..+)?$'; then
+                      out_member="${member##*/}"
+                      if tar -xf "$tmpfile" -C "$workdir" "$member" 2>/dev/null; then
+                        extracted="$(find "$workdir" -type f -name "$out_member" | head -n 1 || true)"
+                        [ -n "$extracted" ] && control_candidates+=("$extracted")
+                      fi
+                    fi
+                  done < "$workdir/tar.list"
+                fi
+              fi
+
+              for c in "${control_candidates[@]}"; do
+                extract_archive_to_dir "$c" "$workdir"
+              done
+
+              nested="$(find "$workdir" -maxdepth 6 -type f \( -name 'control.tar' -o -name 'control.tar.gz' -o -name 'control.tar.xz' -o -name 'control.tar.zst' \) | head -n 1 || true)"
+              if [ -n "$nested" ]; then
+                extract_archive_to_dir "$nested" "$workdir"
+              fi
+
+              control_file=$(find "$workdir" -maxdepth 8 -type f \( -name 'control' -o -name '.control' \) | head -n 1 || true)
+
+              if [ -n "$control_file" ]; then
+                pkg_name=$(get_control_field "Package" "$control_file" || true)
+                pkg_version=$(get_control_field "Version" "$control_file" || true)
+                pkg_arch=$(get_control_field "Architecture" "$control_file" || true)
+                pkg_depends=$(get_control_field "Depends" "$control_file" || true)
+                pkg_license=$(get_control_field "License" "$control_file" || true)
+                pkg_section=$(get_control_field "Section" "$control_file" || true)
+                pkg_description=$(get_control_field "Description" "$control_file" || true)
+              fi
+
+              if [ -z "$pkg_name" ] || [ -z "$pkg_version" ] || [ -z "$pkg_arch" ]; then
+                echo "    ✗ Invalid control metadata in $filename (Package/Version/Architecture are required)"
+                parse_failures=$((parse_failures + 1))
+                rm -rf "$workdir"
+                rm -f "$tmpfile"
+                continue
+              fi
+
+              if [ "$pkg_arch" = "all" ]; then
+                target_arches=("${ARCHS[@]}")
+              elif [ -n "${ARCH_ALIASES[$pkg_arch]:-}" ]; then
+                target_arches=("${ARCH_ALIASES[$pkg_arch]}")
+              elif printf '%s\n' "${ARCHS[@]}" | grep -qx "$pkg_arch"; then
+                target_arches=("$pkg_arch")
+              else
+                echo "    ✗ Unsupported architecture in control ($pkg_arch) for $filename"
+                parse_failures=$((parse_failures + 1))
+                rm -rf "$workdir"
+                rm -f "$tmpfile"
+                continue
+              fi
+
+              for arch in "${target_arches[@]}"; do
+                cp "$tmpfile" "$ROOT/$arch/$filename"
+
+                {
+                  echo "Package: ${pkg_name}"
+                  echo "Version: ${pkg_version}"
+                  echo "Depends: ${pkg_depends}"
+                  echo "License: ${pkg_license}"
+                  echo "Section: ${pkg_section}"
+                  echo "Architecture: ${arch}"
+                  echo "Filename: ${filename}"
+                  echo "Size: $(wc -c < "$ROOT/$arch/$filename")"
+                  echo "SHA256sum: $(sha256sum "$ROOT/$arch/$filename" | awk '{print $1}')"
+                  echo "Description: ${pkg_description}"
+                  echo ""
+                } >> "$ROOT/$arch/Packages"
+
+                echo "    ✓ ${filename} -> ${arch}"
+              done
+
+              rm -rf "$workdir"
+              rm -f "$tmpfile"
+            done
           done
+
+          if [ "$parse_failures" -gt 0 ]; then
+            echo "❌ Found $parse_failures package(s) with invalid or unsupported control metadata"
+            exit 1
+          fi
 
           echo "→ Finalizing all architectures..."
           for arch in "${ARCHS[@]}"; do

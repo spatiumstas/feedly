@@ -23,6 +23,11 @@ fi
 
 mkdir -p /opt/etc/opkg
 printf "%s\n" "$opkg_repos" > /opt/etc/opkg/feedly.conf
+
+for old_repo in /opt/etc/opkg/keensnap.conf /opt/etc/opkg/sms2gram.conf /opt/etc/opkg/web4static.conf; do
+  [ -f "$old_repo" ] && rm -f "$old_repo"
+done
+
 opkg update
 
 exit 0
