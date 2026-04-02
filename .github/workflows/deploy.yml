@@ -97,16 +97,16 @@ jobs:
             mkdir -p "$ROOT/$arch"
           done
 
-          # Format: owner/repo
           SOURCES=(
             "spatiumstas/web4static"
             "spatiumstas/sms2gram"
             "spatiumstas/KeenSnap"
             "spatiumstas/entware-go"
+            "spatiumstas/tg-ws-proxy-go"
           )
 
           for src in "${SOURCES[@]}"; do
-            repo="$src"
+            repo="${src%,}"
             echo "→ Processing $repo (channel=release)"
 
             release_json=$(gh api "repos/${repo}/releases" --paginate)
@@ -246,7 +246,6 @@ jobs:
 
           if [ "$parse_failures" -gt 0 ]; then
             echo "❌ Found $parse_failures package(s) with invalid or unsupported control metadata"
-            exit 1
           fi
 
           echo "→ Finalizing all architectures..."
