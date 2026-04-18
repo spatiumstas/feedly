@@ -132,7 +132,13 @@ jobs:
               filename="${url##*/}"
               tmpfile="/tmp/${repo//\//_}_${filename}"
 
-              if ! curl -f -sSL "$url" -o "$tmpfile"; then
+              if ! curl --fail --silent --show-error --location \
+                --retry 5 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --connect-timeout 20 \
+                --max-time 300 \
+                "$url" -o "$tmpfile"; then
                 echo "    ✗ Failed to download $filename"
                 continue
               fi
