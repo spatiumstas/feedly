@@ -21,6 +21,7 @@ if [ "$found" -eq 0 ]; then
   exit 1
 fi
 
+opkg install wget-ssl
 mkdir -p /opt/etc/opkg
 printf "%s\n" "$opkg_repos" > /opt/etc/opkg/feedly.conf
 
