@@ -108,11 +108,7 @@ jobs:
           for src in "${SOURCES[@]}"; do
             repo="${src%,}"
             echo "→ Processing $repo (channel=release)"
-
-            release_json=$(gh api "repos/${repo}/releases" --paginate)
-
-            selected=$(echo "$release_json" | jq '[.[] | select(.draft == false and .prerelease == false)][0]')
-
+            selected=$(gh api "repos/${repo}/releases/latest")
             if [ "$(echo "$selected" | jq -r '.id // empty')" = "" ]; then
               echo "  ⚠ No release found for $repo"
               continue
@@ -120,7 +116,6 @@ jobs:
 
             tag=$(echo "$selected" | jq -r '.tag_name')
             echo "  ✓ Using tag $tag"
-
             mapfile -t urls < <(echo "$selected" | jq -r '.assets[] | select(.name | test("\\.ipk$")) | .browser_download_url')
 
             if [ ${#urls[@]} -eq 0 ]; then
